@@ -1,0 +1,9 @@
+llm:
+  backend: ollama
+  model: gemma2:9b
+  temperature: 0.4
+  max_tokens: 1024
+  num_ctx: 8192  # or higher if your GPU/RAM can take it
+  reasoning: false  # skip Qwen3's thinking step if you want faster, more predictable output
+  keep_alive: 30m  # Ollama unloads a model from memory 5 minutes after last use by default, -1 to never unload
+

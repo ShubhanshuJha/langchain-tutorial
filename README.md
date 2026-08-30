@@ -1,576 +1,961 @@
-# Omnivore
+# LangChain Tutorial — From Basics to Advanced
 
-**Feed it anything. Ask it anything. See the sources.**
+A structured walkthrough of the **LangChain** ecosystem: what it is, why it exists, and how each moving part fits together. This guide moves from first principles (models and prompts) through the pieces most projects actually assemble in production (chains, RAG, agents) and out to the frontier work (LangGraph, evaluation, multi-agent systems).
 
-A local-first Retrieval-Augmented Generation stack that turns any pile of documents into a queryable, citable knowledge base. Drop PDFs, Word files, spreadsheets, CSVs, JSON, or plain text into a folder, point Omnivore at it, and ask questions in plain language — every answer comes back with inline citations, per-source relevance scores, and a preview of the exact text the model saw.
-
-Nothing leaves your machine by default: embeddings and generation both run through a local Ollama server.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Omnivore                              ● Ollama · gemma2:9b  │
-├──────────────────────────────────────────────────────────────┤
-│  REQ 01   What were the Q3 renewal terms?                    │
-│                                                              │
-│  RESPONSE · 3184ms                                           │
-│  The renewal window runs 60 days before expiry, with …       │
-│                                                              │
-│  SOURCES TRACED — 3                                          │
-│  master_agreement.pdf       p.14  ████████░░  81%            │
-│  master_agreement.pdf       p.17  ██████░░░░  63%            │
-│  renewal_addendum.docx      p.2   ████░░░░░░  44%            │
-└──────────────────────────────────────────────────────────────┘
-```
-
-The design goal is **traceability**: an answer you cannot audit is an answer you cannot trust. Omnivore refuses to answer from the model's own memory — if nothing in your documents clears the relevance threshold, it says so rather than guessing.
+Every section is written to be read in order, but each concept is self-contained enough to skim to when you need it.
 
 ---
 
 ## Table of contents
 
-- [What it eats](#what-it-eats)
-- [Architecture](#architecture)
-- [Project layout](#project-layout)
-- [Prerequisites](#prerequisites)
-- [Quickstart](#quickstart)
-- [Using your own documents](#using-your-own-documents)
-- [Configuration](#configuration)
-- [HTTP API](#http-api)
-- [Ingestion API](#ingestion-api)
-- [Module reference](#module-reference)
-- [Ingestion pipeline in detail](#ingestion-pipeline-in-detail)
-- [Retrieval and scoring](#retrieval-and-scoring)
-- [Frontend](#frontend)
-- [Operational notes](#operational-notes)
-- [Troubleshooting](#troubleshooting)
-- [Known limitations](#known-limitations)
-- [Extending the project](#extending-the-project)
+**Foundations**
+1. [What is LangChain?](#1-what-is-langchain)
+2. [Installation and setup](#2-installation-and-setup)
+3. [The LangChain ecosystem](#3-the-langchain-ecosystem)
+
+**Basics**
+4. [LLMs vs Chat Models](#4-llms-vs-chat-models)
+5. [Prompt Templates](#5-prompt-templates)
+6. [Output Parsers](#6-output-parsers)
+7. [Chains: the classic view](#7-chains-the-classic-view)
+8. [LangChain Expression Language (LCEL)](#8-langchain-expression-language-lcel)
+
+**Intermediate**
+9. [Memory](#9-memory)
+10. [Document Loaders](#10-document-loaders)
+11. [Text Splitters](#11-text-splitters)
+12. [Embeddings](#12-embeddings)
+13. [Vector Stores](#13-vector-stores)
+14. [Retrievers](#14-retrievers)
+15. [Retrieval-Augmented Generation (RAG)](#15-retrieval-augmented-generation-rag)
+
+**Advanced**
+16. [Tools and Function Calling](#16-tools-and-function-calling)
+17. [Agents](#17-agents)
+18. [LangGraph: stateful, cyclical workflows](#18-langgraph-stateful-cyclical-workflows)
+19. [Streaming, Callbacks, and Tracing](#19-streaming-callbacks-and-tracing)
+20. [Structured Output](#20-structured-output)
+21. [Multi-modal chains](#21-multi-modal-chains)
+22. [Evaluation with LangSmith](#22-evaluation-with-langsmith)
+23. [Production concerns](#23-production-concerns)
+
+**Reference**
+24. [Common pitfalls](#24-common-pitfalls)
+25. [Further reading](#25-further-reading)
 
 ---
 
-## What it eats
+## 1. What is LangChain?
 
-[`load_all_documents`](src/rag/data_loader.py) recursively walks a directory and dispatches each file to a format-specific LangChain loader:
+LangChain is a framework for building applications powered by Large Language Models (LLMs). It exists because a raw call to an LLM API is only ever the last step of a real application — everything around it (fetching the right context, formatting the prompt, parsing the output, calling tools, remembering prior turns, retrying failures) is what LangChain gives you a vocabulary and a set of composable primitives for.
 
-| Format | Extension | Loader | Notes |
-|---|---|---|---|
-| PDF | `.pdf` | `PyPDFLoader` | One document per page — this is what makes page-level citations possible |
-| Plain text | `.txt` | `TextLoader` | |
-| Spreadsheet | `.csv` | `CSVLoader` | One document per row |
-| Excel | `.xlsx` | `UnstructuredExcelLoader` | Needs `unstructured` + `openpyxl` |
-| Word | `.docx` | `Docx2txtLoader` | Needs `docx2txt` |
-| JSON | `.json` | `JSONLoader` | Currently non-functional — see [Known limitations](#known-limitations) |
+**The mental model.** Think of LangChain as three layers on top of the model API:
 
-Every file is loaded inside its own `try/except`, so one corrupt PDF costs you that one file rather than aborting the whole ingest. Mixed-format directories are the expected case, not an edge case — nested subfolders are walked too.
-
-Adding a seventh format is a dozen lines in one function; there is no plugin registry to learn.
-
----
-
-## Architecture
-
-Two distinct paths run through the system: a one-time **ingestion path** (cold start only) and a per-request **query path**.
-
-```mermaid
-flowchart TB
-    subgraph Ingest["Ingestion — runs once, only when the collection is empty"]
-        A["data/<br/>pdf · txt · csv · xlsx · docx · json"] --> B["load_all_documents()<br/>one loader per format"]
-        B --> C["split_documents()<br/>RecursiveCharacterTextSplitter<br/>1500 chars / 200 overlap"]
-        C --> D["generate_embeddings()<br/>Ollama all-minilm · batched x128"]
-        D --> E[("ChromaDB<br/>data/vector_store<br/>collection: omnivore_docs")]
-    end
-
-    subgraph Query["Query — per request"]
-        F["POST /api/query"] --> G["AdvancedRAGSearch.query()"]
-        G --> H["RAGRetriever.retrieve()"]
-        H --> I["embed question"]
-        I --> E
-        E --> J["top-k nearest neighbours<br/>similarity = 1 − cosine distance"]
-        J --> K{"score ≥ min_score?"}
-        K -->|no| L["drop chunk"]
-        K -->|yes| M["build context block"]
-        M --> N["LLM.invoke()<br/>ChatOllama or ChatGroq"]
-        N --> O["answer + citations + sources[]"]
-        O --> P["session history"]
-        O --> Q["JSON → browser"]
-    end
-```
-
-**Layering.** Each module owns exactly one concern and depends only downward:
-
-| Layer | Module | Responsibility |
+| Layer | Purpose | Example primitives |
 |---|---|---|
-| Presentation | `app.py`, `templates/`, `static/` | HTTP routes, wiring, UI |
-| Orchestration | `rag/search.py` | Prompt assembly, citations, summarisation, history |
-| Retrieval | `rag/retriever.py` | Query embedding, ANN search, score thresholding |
-| Storage | `rag/vector_store.py` | ChromaDB lifecycle, ID generation, ingestion |
-| Encoding | `rag/embedding.py` | Chunking + embedding (Ollama *or* SentenceTransformer) |
-| Loading | `rag/data_loader.py` | Filesystem → LangChain `Document` |
+| **I/O** | Format input, parse output | `PromptTemplate`, `OutputParser` |
+| **Composition** | Combine steps into pipelines | LCEL (`\|` operator), `Runnable` |
+| **Application** | Domain patterns | RAG, agents, memory, tools |
 
-Because the layers are decoupled, swapping any one of them is local: a different vector DB touches only `vector_store.py`, a different LLM touches only the `app.py` wiring, and a new file format touches only `data_loader.py`.
+**When to reach for it — and when not to.** LangChain shines when your application composes multiple LLM calls, or mixes LLM calls with retrieval, tools, or control flow. For a single one-shot prompt against a single model, the vendor SDK is often enough and lighter. Reach for LangChain when the shape of your application starts to look like a *pipeline* rather than a *call*.
 
 ---
 
-## Project layout
+## 2. Installation and setup
 
-```
-omnivore/
-├── data/
-│   ├── pdf_files/              # Sample corpus — replace with your own
-│   ├── text_files/
-│   └── vector_store/           # ChromaDB persistence (chroma.sqlite3 + HNSW index)
-├── src/
-│   ├── app.py                  # Flask entrypoint + pipeline wiring
-│   ├── ingest_api.py           # Ingestion API (Blueprint — app.py untouched)
-│   ├── rag/
-│   │   ├── data_loader.py      # Multi-format document loading
-│   │   ├── embedding.py        # EmbeddingManager: chunking + vectorisation
-│   │   ├── vector_store.py     # VectorStore: ChromaDB wrapper
-│   │   ├── retriever.py        # RAGRetriever: similarity search
-│   │   └── search.py           # AdvancedRAGSearch: the RAG orchestrator
-│   ├── templates/index.html    # Single-page UI shell
-│   └── static/
-│       ├── css/style.css       # Terminal-inspired dark theme
-│       └── js/app.js           # Fetch calls, source bars, copy-to-clipboard
-└── requirements.txt
-```
+The framework is modular — you install the pieces you use rather than one monolithic package.
 
-The bundled `data/` holds a sample corpus of AWS data-engineering material, useful for verifying the pipeline end to end before you swap in your own documents.
+```bash
+# Core abstractions (Runnable, PromptTemplate, etc.)
+pip install langchain-core
 
----
+# The "batteries-included" package for common chains and legacy imports
+pip install langchain
 
-## Prerequisites
+# Community integrations (many vector stores, loaders, tools)
+pip install langchain-community
 
-| Requirement | Why | Notes |
-|---|---|---|
-| Python 3.10+ | Runtime | The checked-in `__pycache__` is CPython 3.14 |
-| [Ollama](https://ollama.com) running locally | Default embedding **and** LLM backend | `http://localhost:11434` |
-| `ollama pull all-minilm` | 384-dim embedding model | Required for both ingestion and query |
-| `ollama pull gemma2:9b` | Answer generation | ~5.4 GB; needs ~8 GB RAM free |
-| *(optional)* Groq API key | Cloud LLM alternative | Set `use_ollama_llm = False` |
+# Provider packages — install only what you need
+pip install langchain-openai         # OpenAI
+pip install langchain-anthropic      # Anthropic (Claude)
+pip install langchain-google-genai   # Google Gemini
+pip install langchain-ollama         # Local models via Ollama
 
-Ollama must be reachable **before** the Flask app starts — `EmbeddingManager` sends a probe embedding at construction time and re-raises on failure, so a missing model kills startup rather than failing silently later.
-
----
-
-## Quickstart
-
-```powershell
-# 1 — install
-python -m venv myvenv
-.\myvenv\Scripts\Activate.ps1
-pip install -r omnivore/requirements.txt
-pip install flask langchain-classic numpy      # see "Known limitations"
-
-# 2 — pull models
-ollama pull all-minilm
-ollama pull gemma2:9b
-
-# 3 — run (working directory matters, see below)
-cd omnivore/src
-python app.py
+# Graph-based orchestration
+pip install langgraph
 ```
 
-Open **http://127.0.0.1:5000**.
-
-> **Run from `src/`.** Both `load_all_documents(data_dir='../data')` and the `VectorStore` default `persist_directory='../data/vector_store'` are relative paths. Launching from anywhere else creates a second, empty `data/vector_store` and silently re-ingests into it.
-
-**First run vs. subsequent runs.** [`app.py:45-60`](src/app.py#L45-L60) checks `collection.count()` before doing any work. Cold start walks the full load → chunk → embed → ingest pipeline (minutes, depending on corpus size and CPU). Every later start prints `Collection already has N documents — skipping ingestion` and is up in seconds.
-
----
-
-## Using your own documents
-
-Use the [Ingestion API](#ingestion-api) — it adds documents to a running server, one file or a whole tree at a time, and skips anything already indexed:
-
-```powershell
-# everything under data/ that isn't already indexed (also the first-time init)
-curl.exe -X POST http://127.0.0.1:5001/api/ingest
-
-# one new file
-curl.exe -X POST http://127.0.0.1:5001/api/ingest -H "Content-Type: application/json" -d "{\"path\": \"../data/reports/q3.pdf\"}"
-
-# upload straight from your machine
-curl.exe -F "file=@handbook.pdf" http://127.0.0.1:5001/api/ingest/upload
-```
-
-The older, restart-based route still works: drop files under `data/`, delete `data/vector_store/`, restart. It re-embeds the entire corpus, so it is only worth it for a full rebuild.
-
-**A few things worth knowing before you point it at a large corpus:**
-
-- **Budget the embedding time.** The bundled 7-file sample corpus (1788 pages → 2893 chunks) takes about 2½ minutes on CPU. Scale roughly linearly.
-- **Deduplication is by file path**, so a document edited in place needs `mode=replace`; the default `skip` sees the path already present and leaves it alone.
-- Scanned PDFs yield nothing. `PyPDFLoader` extracts an embedded text layer; it does not do OCR. Run such files through an OCR pass first.
-- Keep the corpus coherent. Retrieval quality on a mixed grab-bag degrades quickly, because a `top_k` of 5 gets spread across unrelated subject matter. Separate corpora are better served by separate collections — see [Configuration](#configuration).
-
-**Running multiple corpora.** `VectorStore` takes `collection_name` as a constructor argument, so several independent document sets can share one ChromaDB directory:
-
-```python
-vector_store = VectorStore(collection_name="contracts")   # or "research", "handbooks", …
-```
-
-Each name is an isolated index. Switching between them today means editing [`app.py:40`](src/app.py#L40) and restarting; wiring it to a dropdown in the UI is a natural next step.
-
----
-
-## Configuration
-
-All knobs currently live as module-level constants in [`app.py`](src/app.py). Nothing is read from the environment except the Groq key.
-
-| Setting | Location | Default | Effect |
-|---|---|---|---|
-| `use_ollama_llm` | [`app.py:65`](src/app.py#L65) | `True` | `True` → `ChatOllama(gemma2:9b)`; `False` → `ChatGroq(gemma2-9b-it)` |
-| `temperature` | [`app.py:67`](src/app.py#L67) | `0.1` | Low, deliberately — RAG answers should be extractive |
-| `max_token` | [`app.py:66`](src/app.py#L66) | `1024` | Maps to `num_predict` (Ollama) / `max_tokens` (Groq) |
-| `collection_name` | [`app.py:40`](src/app.py#L40) | `omnivore_docs` | ChromaDB collection — one per corpus |
-| `model_name` (embedding) | [`app.py:39`](src/app.py#L39) | `all-minilm` | Ollama tag; must match what the store was built with |
-| `data_dir` | [`app.py:55`](src/app.py#L55) | `../data` | Root of the document tree, walked recursively |
-| `chunk_size` / `chunk_overlap` | [`embedding.py:81`](src/rag/embedding.py#L81) | `1500` / `200` | ~13% overlap preserves cross-boundary context |
-| `batch_size` | [`embedding.py:101`](src/rag/embedding.py#L101) | `128` | Ollama embed batching |
-| `top_k` | [`search.py:13`](src/rag/search.py#L13) | `5` | Chunks retrieved per query |
-| `min_score` | [`search.py:13`](src/rag/search.py#L13) | `0.1` | Similarity floor (`1 − cosine distance`) |
-
-**Tuning `chunk_size` to your documents.** The 1500/200 default suits prose and technical documentation. Dense reference material, tables, and Q&A-style content generally do better around 800/150, where each chunk stays on a single topic. Long-form narrative can go to 2000+. The overlap exists so a fact split across a chunk boundary still appears intact in one of them — keep it near 10–15% of `chunk_size`.
-
-**Environment.** Create `.env` at the repo root:
+**API keys.** Providers are configured through environment variables. Use a `.env` file loaded with `python-dotenv` — do not hardcode keys.
 
 ```dotenv
-GROQ_API_KEY=your_key_here
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_TRACING=true
 ```
-
-Loaded via `python-dotenv` at [`app.py:17`](src/app.py#L17). Only consulted when `use_ollama_llm = False`.
-
-> ⚠️ **The `.env` currently in the repo root contains a live Groq key.** It is untracked today, but add `.env` to `.gitignore` and rotate that key before this repository is pushed anywhere.
-
-**Changing the embedding model is a breaking change.** Embeddings are only comparable within the same model's vector space. If you switch from `all-minilm` to anything else, delete `data/vector_store/` and re-ingest — otherwise queries are embedded in one space and searched against another, producing confidently wrong results with no error.
-
----
-
-## HTTP API
-
-### `GET /`
-Renders the Omnivore UI.
-
-### `GET /api/status`
-Reports the wired backend. Drives the status badge in the topbar.
-
-```json
-{
-  "embedding_model": "all-minilm",
-  "llm_backend": "Ollama",
-  "llm_model": "gemma2:9b",
-  "status": "online"
-}
-```
-
-`status` is `"not configured"` when `rag is None` (retriever or LLM failed to construct).
-
-### `POST /api/query`
-
-**Request** — only `query` is required; omitted overrides fall through to `AdvancedRAGSearch.query`'s own defaults, so the API never accidentally pins them.
-
-```json
-{
-  "query": "What are the renewal terms?",
-  "top_k": 5,
-  "min_score": 0.1,
-  "summarize": false
-}
-```
-
-**Response `200`**
-
-```json
-{
-  "answer": "The renewal window runs 60 days before expiry…\n\nCitations:\n[1] master_agreement.pdf (page 14)",
-  "summary": null,
-  "sources": [
-    {
-      "source": "master_agreement.pdf",
-      "page": 14,
-      "score": 0.7412,
-      "preview": "Either party may elect not to renew by providing…"
-    }
-  ],
-  "elapsed_ms": 3184
-}
-```
-
-| Status | Condition |
-|---|---|
-| `400` | Empty or whitespace-only `query` |
-| `500` | Pipeline not wired (`rag is None`), or any exception inside `rag.query` |
-
-Server-side latency is measured around the `rag.query` call only ([`app.py:138-143`](src/app.py#L138-L143)) — it covers embedding + ANN search + LLM generation, not HTTP overhead.
-
-### `GET /api/history`
-
-Returns the in-process query log accumulated by `AdvancedRAGSearch` since startup.
-
-```json
-{ "history": [ { "question": "...", "answer": "...", "sources": [], "summary": null } ] }
-```
-
-In-memory and single-process — it does not survive a restart, and with `debug=True` the reloader may reset it.
-
----
-
-## Ingestion API
-
-Lives in [`ingest_api.py`](src/ingest_api.py) as a Flask Blueprint, deliberately separate from `app.py`. It replaces the delete-the-folder-and-restart loop: documents can be added while the server is running, and re-running it is safe.
-
-**Register it into the main app** (one line, when you want it) — passing the existing objects avoids loading a second copy of the embedding model:
 
 ```python
-from ingest_api import ingest_bp, configure
-configure(embedding_manager=embedding_manager, vector_store=vector_store)
-app.register_blueprint(ingest_bp)
+from dotenv import load_dotenv
+load_dotenv()
 ```
-
-**Or run it standalone** on its own port, next to `app.py`:
-
-```powershell
-cd omnivore/src
-python ingest_api.py          # http://127.0.0.1:5001
-```
-
-### Ingest modes
-
-`VectorStore.ingest_documents` appends blindly, so this module deduplicates on the `source` metadata field every loader sets:
-
-| Mode | Behaviour |
-|---|---|
-| `skip` *(default)* | Leave files already in the collection alone. Makes `POST /api/ingest` idempotent, and a no-op once initialization has run. |
-| `replace` | Delete the existing chunks for that source, then re-ingest. The correct mode for a file that changed on disk. |
-| `append` | Ingest regardless, duplicates included. Escape hatch only. |
-
-Under `replace`, the delete happens only *after* embedding succeeds, so a failure mid-run cannot leave the collection missing the old chunks without having the new ones.
-
-### `GET /api/ingest/status`
-
-```json
-{
-  "collection": "omnivore_docs",
-  "chunks": 2893,
-  "source_files": ["C:\\...\\aws_dms_documentation.pdf", "..."],
-  "source_file_count": 7,
-  "data_dir": "C:\\...\\omnivore\\data",
-  "supported_extensions": [".csv", ".docx", ".json", ".pdf", ".txt", ".xlsx"]
-}
-```
-
-### `POST /api/ingest`
-
-Every field is optional. A bare `POST` with no body ingests everything under `data/` that is not already present — this is the **initialization** call, and it is safe against a populated store.
-
-```json
-{
-  "path": "../data",
-  "mode": "skip",
-  "chunk_size": 1500,
-  "chunk_overlap": 200
-}
-```
-
-`path` accepts a single file or a directory; directories are walked recursively.
-
-```json
-{
-  "collection": "omnivore_docs",
-  "mode": "skip",
-  "files_found": 7,
-  "files_ingested": 7,
-  "files_skipped": 0,
-  "files_failed": 0,
-  "documents_loaded": 1788,
-  "chunks_added": 2893,
-  "chunks_replaced": 0,
-  "chunks_before": 0,
-  "chunks_after": 2893,
-  "elapsed_ms": 158773,
-  "details": [
-    {"file": "...\\python_intro.txt", "status": "ingested", "documents": 1, "replaced_chunks": 0},
-    {"file": "...\\stale.pdf", "status": "skipped", "reason": "already ingested", "existing_chunks": 12},
-    {"file": "...\\broken.pdf", "status": "error", "reason": "loader produced no text (scanned PDF with no text layer?)"}
-  ]
-}
-```
-
-`details` is per file, so a partial success reports exactly which files landed and which did not — one bad file never fails the batch.
-
-### `POST /api/ingest/upload`
-
-Multipart upload. Files are saved under `data/uploads/` and ingested in one step. The form field is `file`, repeatable for multiple uploads.
-
-```powershell
-curl.exe -F "file=@handbook.pdf" -F "mode=replace" http://127.0.0.1:5001/api/ingest/upload
-```
-
-Defaults to `mode=replace`, since re-uploading a filename normally means "this is the new version." Filenames pass through `secure_filename`, so an upload cannot escape `data/uploads/`. Unsupported extensions come back in a `rejected` array rather than failing the whole request. The 100 MB cap applies in standalone mode only — `MAX_CONTENT_LENGTH` is set in `create_app()`, so registering the blueprint into `app.py` inherits that app's limit instead.
-
-| Status | Condition |
-|---|---|
-| `400` | Bad mode, non-integer or overlapping chunk params, no file in upload |
-| `404` | `path` does not exist |
-| `500` | Embedding or storage failed mid-run |
-| `503` | Ollama unreachable, or the vector store failed to initialize |
-
-### Concurrency
-
-Ingestion is serialized behind a `threading.Lock` — concurrent runs would interleave their dedup checks and defeat them.
-
-Across *processes* there is no such protection. ChromaDB's `PersistentClient` is backed by SQLite, which does not expect two processes writing the same database, so running this standalone while `app.py` is also up is fine for read-mostly querying but a large ingest can lock the file long enough for a query to fail. For heavy use, register the blueprint into `app.py` so both share one client in one process.
 
 ---
 
-## Module reference
+## 3. The LangChain ecosystem
 
-### `EmbeddingManager` — [`src/rag/embedding.py`](src/rag/embedding.py)
+LangChain is not one library — it is a family of related packages, each solving one problem:
 
-Dual-backend encoder. The Ollama path (default) avoids any HuggingFace download entirely, which makes the project viable on an air-gapped or proxy-restricted machine.
+| Package | What it is |
+|---|---|
+| `langchain-core` | The bedrock abstractions: `Runnable`, `BaseMessage`, `PromptTemplate`, `OutputParser`. Zero heavy dependencies. |
+| `langchain` | Higher-level chains and application-level building blocks that compose the core primitives. |
+| `langchain-community` | Community-contributed integrations — loaders, vector stores, tools that live outside the first-party providers. |
+| `langchain-<provider>` | Official integration packages, one per model provider (OpenAI, Anthropic, Google, Ollama, …). |
+| `langgraph` | Graph-based orchestration for stateful, cyclical multi-step agents. |
+| `langsmith` | Observability, tracing, evaluation, prompt management. |
+| `langserve` | Deploy a LangChain `Runnable` as a REST API with one line. |
 
-- **`__load_model()`** — for Ollama, sends a single `embed(input="test")` probe and derives `embedding_dim` from the response, so an unreachable server or unpulled model fails loudly *at construction*, not at first query.
-- **`split_documents(documents, chunk_size=1500, chunk_overlap=200)`** — `RecursiveCharacterTextSplitter` with separators `['\n\n', '\n', ' ', '']`, descending in granularity so paragraph boundaries win over word boundaries.
-- **`generate_embeddings(texts, batch_size=128)`** — chunks the input into batches with per-batch progress logging. Defensively coerces `List[Document]` → `List[str]` if a caller passes documents instead of raw text. Returns `np.ndarray` of shape `(n, embedding_dim)`.
-- **`__repr__`** — prints backend, model, and dimension, so `embedding_manager` alone in a notebook cell is a useful health check.
+The split matters: `langchain-core` is intentionally small so it can be a stable dependency, while integrations evolve independently in their own packages.
 
-### `VectorStore` — [`src/rag/vector_store.py`](src/rag/vector_store.py)
+---
 
-Thin, honest wrapper over a `chromadb.PersistentClient`.
+## 4. LLMs vs Chat Models
 
-- `get_or_create_collection` makes construction idempotent — restarting never destroys the index.
-- `ingest_documents` asserts `len(documents) == len(embeddings)` up front, then builds parallel `ids / metadatas / documents / embeddings` arrays for a single `collection.add()`.
-- IDs are `doc_{uuid4[:10]}_{idx}` — collision-resistant *and* order-preserving for debugging.
-- Metadata is enriched with `doc_index` and `content_length` on top of whatever the loader supplied (`source`, `page`, …). Since each loader sets its own metadata, this is where format-specific provenance survives into the citations.
+LangChain distinguishes two model interfaces:
 
-### `RAGRetriever` — [`src/rag/retriever.py`](src/rag/retriever.py)
+- **LLMs** (`BaseLLM`) — take a string, return a string. The older, "completion" style.
+- **Chat Models** (`BaseChatModel`) — take a list of `BaseMessage` objects (`SystemMessage`, `HumanMessage`, `AIMessage`, `ToolMessage`), return a `BaseMessage`. This is what every modern provider actually exposes.
 
-Embeds the query with the *same* `EmbeddingManager` used at ingestion (the single most important invariant in the system), runs `collection.query(n_results=top_k)`, converts Chroma's cosine **distance** to a **similarity** via `1 - distance`, filters by `score_threshold`, and returns enriched dicts:
+**Always prefer Chat Models.** Even for single-turn use, chat models give you role separation (system vs user), native tool-calling support, and forward compatibility.
 
 ```python
-{'id', 'content', 'metadata', 'similarity_score', 'distance', 'rank'}
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+
+response = llm.invoke([
+    SystemMessage(content="You are a terse Python expert."),
+    HumanMessage(content="Explain list comprehensions in two sentences."),
+])
+print(response.content)
 ```
 
-Failures are swallowed and returned as `[]`, which `AdvancedRAGSearch` handles as "no relevant context found" rather than a 500.
+**Common parameters.**
 
-### `AdvancedRAGSearch` — [`src/rag/search.py`](src/rag/search.py)
-
-The orchestrator.
-
-1. **Retrieve** `top_k` chunks above `min_score`.
-2. **Short-circuit** — if nothing survives the threshold, return `"No relevant context found."` *without calling the LLM*. This is deliberate: it prevents the model from answering from parametric memory and presenting it as grounded.
-3. **Assemble context** — chunks joined with `\n\n` into a single grounding block.
-4. **Generate** via `llm_model.invoke()` — any LangChain chat model works, since only `.invoke()` and `.content` are relied upon.
-5. **Cite** — appends `[n] <source> (page <p>)` lines, indices aligned with the `sources` array the UI renders.
-6. **Summarise** *(optional)* — a second LLM call condensing the answer to two sentences.
-7. **Record** — appends to `self.history`.
-
-### `load_all_documents` — [`src/rag/data_loader.py`](src/rag/data_loader.py)
-
-Recursively globs `**/*` once per supported extension and hands each match to its loader. See [What it eats](#what-it-eats) for the format table. Verbose `[DEBUG]` logging reports the file count found per format and the document count produced by each file, which is the fastest way to spot a format that silently loaded nothing.
-
----
-
-## Ingestion pipeline in detail
-
-| Stage | Input | Output | Notes |
-|---|---|---|---|
-| Load | `data/**` | `List[Document]` | PDFs yield one `Document` per page, carrying `source` + `page` metadata — this is what makes page-level citations possible |
-| Split | `List[Document]` | ~N× chunks | 1500 chars with 200 overlap; metadata is inherited by every chunk |
-| Embed | `List[str]` | `(N, 384)` array | Batched at 128; `all-minilm` is 384-dimensional |
-| Ingest | chunks + vectors | ChromaDB rows | Single `add()` call; HNSW index persists to `data/vector_store/` |
-
-Metadata granularity varies by format, and this shows up directly in your citations. PDFs carry a real `page`; text, Word, and Excel files generally do not, so `search.py` falls back to `'unknown'` for those. If page-level provenance matters for a given corpus, PDF is the format that gives it to you for free.
-
-The `content_length` metadata field is worth keeping in mind when tuning: chunks far below `chunk_size` are usually document tails or short pages, and they tend to score noisily.
-
----
-
-## Retrieval and scoring
-
-ChromaDB returns **cosine distance**; the UI wants **similarity**. The conversion at [`retriever.py:34`](src/rag/retriever.py#L34) is `similarity = 1 - distance`, giving roughly:
-
-| Similarity | Reading |
+| Parameter | Effect |
 |---|---|
-| `> 0.75` | Strong lexical + semantic overlap; near-verbatim source |
-| `0.45 – 0.75` | Genuinely relevant, paraphrased |
-| `0.20 – 0.45` | Topical but weak — usually noise in a small corpus |
-| `< 0.20` | Unrelated |
-
-The default `min_score = 0.1` is permissive by design: it favours recall on a small corpus where an over-strict floor would leave the model with no context at all. Raise it toward `0.35` once the corpus grows and false-positive chunks start crowding out real ones.
-
-Note that `top_k` is applied by ChromaDB **before** thresholding, so a query can return fewer than `top_k` chunks — never more.
+| `temperature` | Randomness. `0` for deterministic extractive work, `0.7+` for creative. |
+| `max_tokens` | Cap on output length. |
+| `top_p` | Nucleus sampling — usually leave at default. |
+| `timeout` | Request timeout in seconds. |
+| `max_retries` | Automatic retries on transient errors. |
 
 ---
 
-## Frontend
+## 5. Prompt Templates
 
-A dependency-free single page (no framework, no build step) styled as a diagnostics console.
+A `PromptTemplate` is a string with named placeholders and the machinery to fill them safely. It lets you separate the *shape* of a prompt from the *data* that flows through it.
 
-- **`fetchStatus()`** polls `/api/status` on load and renders a green/red dot plus `backend · model · embedder`.
-- **Entries** are numbered `REQ 01`, `REQ 02`, … with an animated five-bar trace loader while the request is in flight.
-- **Source rows** animate their relevance bar to `score × 100%` on the next frame (`requestAnimationFrame`), so CSS transitions actually fire.
-- **`escapeHtml()`** routes every model- and user-supplied string through `textContent`, so retrieved document text cannot inject markup.
-- **Copy answer** writes the raw answer to the clipboard with transient `copied` feedback.
-- **Reset** clears the visual log client-side only — server-side `rag.history` is untouched.
-- Enter submits; the input is disabled for the duration of the request to prevent double-sends.
+**`PromptTemplate` — single-turn.**
+
+```python
+from langchain_core.prompts import PromptTemplate
+
+template = PromptTemplate.from_template(
+    "Translate the following English text to {language}:\n\n{text}"
+)
+prompt = template.invoke({"language": "French", "text": "Good morning"})
+```
+
+**`ChatPromptTemplate` — the one you actually want.** It builds a list of role-tagged messages, which is what chat models consume:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant specialising in {domain}."),
+    ("human", "{question}"),
+])
+
+messages = prompt.invoke({"domain": "astronomy", "question": "Why is the sky blue?"})
+```
+
+**`MessagesPlaceholder` — for conversation history.** Use this when a list of messages needs to be injected at a specific position:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant."),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{input}"),
+])
+```
+
+**Few-shot prompting.** For teaching by example, use `FewShotChatMessagePromptTemplate`:
+
+```python
+from langchain_core.prompts import FewShotChatMessagePromptTemplate, ChatPromptTemplate
+
+examples = [
+    {"input": "2 + 2", "output": "4"},
+    {"input": "3 * 5", "output": "15"},
+]
+
+example_prompt = ChatPromptTemplate.from_messages([
+    ("human", "{input}"),
+    ("ai", "{output}"),
+])
+
+few_shot = FewShotChatMessagePromptTemplate(
+    example_prompt=example_prompt,
+    examples=examples,
+)
+
+final_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a calculator."),
+    few_shot,
+    ("human", "{input}"),
+])
+```
 
 ---
 
-## Operational notes
+## 6. Output Parsers
 
-**Ingestion runs at import time.** The load/chunk/embed block sits at module scope in `app.py`, not inside a route or `if __name__ == "__main__"`. With `debug=True` the Werkzeug reloader imports the module in a second process, so on a cold start you may see the ingestion banner twice. The `count() > 0` guard makes the second pass a no-op in practice, but for production use `debug=False` and move ingestion behind an explicit CLI step.
+An `OutputParser` converts the model's raw string response into a structured Python object. Parsers also generate the *format instructions* that get injected into the prompt so the model knows what shape to emit.
 
-**Single-process assumptions.** `rag.history` lives in process memory. Any multi-worker deployment (gunicorn `-w 2`, etc.) gives each worker its own disjoint history, and `/api/history` returns whichever worker answered.
+**`StrOutputParser`** — the identity parser, useful in LCEL to extract `.content` from a message:
 
-**Re-indexing.** Delete `data/vector_store/` and restart.
+```python
+from langchain_core.output_parsers import StrOutputParser
+chain = prompt | llm | StrOutputParser()
+```
+
+**`JsonOutputParser`** — parses JSON responses:
+
+```python
+from langchain_core.output_parsers import JsonOutputParser
+parser = JsonOutputParser()
+prompt = prompt.partial(format_instructions=parser.get_format_instructions())
+```
+
+**`PydanticOutputParser`** — parses into a validated Pydantic model, giving you typed access and validation for free:
+
+```python
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticOutputParser
+
+class Person(BaseModel):
+    name: str = Field(description="Full name")
+    age: int = Field(description="Age in years")
+
+parser = PydanticOutputParser(pydantic_object=Person)
+```
+
+Prefer the model's native structured-output support (see [Section 20](#20-structured-output)) when the provider exposes it — parsers are the fallback for models that don't.
 
 ---
 
-## Troubleshooting
+## 7. Chains: the classic view
 
-| Symptom | Cause | Fix |
+Historically, a "chain" was any object that composed multiple steps — `LLMChain`, `SequentialChain`, `RetrievalQA`, `ConversationChain`, and so on. These are now **legacy**. Modern LangChain composes chains using LCEL (next section), which is more explicit, streamable, and debuggable.
+
+You will still see legacy chains in older codebases and tutorials:
+
+```python
+# Legacy — avoid in new code
+from langchain.chains import LLMChain
+chain = LLMChain(llm=llm, prompt=prompt)
+result = chain.run(question="What is Python?")
+```
+
+Every legacy chain has a direct LCEL equivalent. The rest of this guide uses LCEL exclusively.
+
+---
+
+## 8. LangChain Expression Language (LCEL)
+
+LCEL is a small declarative language for composing `Runnable` objects with the pipe operator (`|`). It is the modern way to build every chain in LangChain.
+
+**The core insight.** Anything that can be `.invoke()`d — a prompt, a model, a parser, a retriever, an arbitrary Python function — is a `Runnable`. Piping two runnables produces a new runnable whose output of the first feeds the input of the second.
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI
+
+prompt = ChatPromptTemplate.from_template("Tell me a joke about {topic}")
+llm = ChatOpenAI(model="gpt-4o-mini")
+parser = StrOutputParser()
+
+chain = prompt | llm | parser
+chain.invoke({"topic": "database indexes"})
+```
+
+**Every LCEL chain automatically supports:**
+
+| Method | What it does |
+|---|---|
+| `.invoke(input)` | Run synchronously, return a single result |
+| `.ainvoke(input)` | Async version |
+| `.batch(inputs)` | Run over a list, parallelised where possible |
+| `.stream(input)` | Yield tokens as they arrive |
+| `.astream(input)` | Async streaming |
+
+You do not need to opt in to any of these — implementing one runnable gives you all five interfaces for free.
+
+**`RunnableParallel` — fan out to multiple branches:**
+
+```python
+from langchain_core.runnables import RunnableParallel
+
+chain = RunnableParallel(
+    joke=prompt_joke | llm | parser,
+    poem=prompt_poem | llm | parser,
+) | combine_step
+```
+
+Both branches run concurrently.
+
+**`RunnablePassthrough` — inject the input into the output shape:**
+
+```python
+from langchain_core.runnables import RunnablePassthrough
+
+chain = (
+    {"context": retriever, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | parser
+)
+chain.invoke("What is LCEL?")
+```
+
+The dict here is a common RAG shape: the question is passed through unchanged while the retriever fetches context in parallel.
+
+**`RunnableLambda` — lift any function into a chain:**
+
+```python
+from langchain_core.runnables import RunnableLambda
+
+def uppercase(text: str) -> str:
+    return text.upper()
+
+chain = prompt | llm | parser | RunnableLambda(uppercase)
+```
+
+**Why LCEL matters.** The pipe syntax is not just sugar — it is what enables uniform streaming, batching, async, and tracing across every combination. When you compose custom logic with `RunnableLambda`, it participates in the same interface as everything else.
+
+---
+
+## 9. Memory
+
+An LLM has no memory of prior conversation turns. Memory in LangChain is the pattern of storing past messages and reinjecting them into subsequent prompts.
+
+**Modern approach — `RunnableWithMessageHistory`.** Wrap any chain with a per-session message store:
+
+```python
+from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+store: dict[str, BaseChatMessageHistory] = {}
+
+def get_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = InMemoryChatMessageHistory()
+    return store[session_id]
+
+chain_with_history = RunnableWithMessageHistory(
+    chain,
+    get_history,
+    input_messages_key="input",
+    history_messages_key="history",
+)
+
+chain_with_history.invoke(
+    {"input": "Hi, I'm Alice."},
+    config={"configurable": {"session_id": "user-123"}},
+)
+```
+
+**Trimming.** Full history grows without bound. Use `trim_messages` to keep only the last N tokens or messages:
+
+```python
+from langchain_core.messages import trim_messages
+trimmer = trim_messages(max_tokens=1000, strategy="last", token_counter=llm)
+```
+
+**Persistent memory.** `InMemoryChatMessageHistory` disappears on restart. For durability, use `RedisChatMessageHistory`, `PostgresChatMessageHistory`, or the file-based `FileChatMessageHistory` — all in `langchain-community`.
+
+**Legacy memory classes** (`ConversationBufferMemory`, `ConversationSummaryMemory`, etc.) are deprecated in favor of the runnable-based approach. Avoid them in new code.
+
+---
+
+## 10. Document Loaders
+
+A `DocumentLoader` reads content from a source (a file, a URL, a database) and returns a list of `Document` objects, each with `page_content` and `metadata`.
+
+```python
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, WebBaseLoader
+
+pdf_docs = PyPDFLoader("report.pdf").load()          # one Document per page
+txt_docs = TextLoader("notes.txt").load()
+web_docs = WebBaseLoader("https://example.com").load()
+```
+
+**Common loaders.**
+
+| Loader | Source | Notes |
 |---|---|---|
-| Startup raises from `EmbeddingManager` | Ollama not running, or `all-minilm` not pulled | `ollama serve`; `ollama pull all-minilm` |
-| `pipeline unreachable` in the status badge | Flask up but `/api/status` failing, or server down | Check the terminal for the traceback |
-| `"No relevant context found."` for a fair question | Empty collection, or `min_score` too high | Verify `collection.count() > 0`; lower `min_score` |
-| A format loaded zero documents | Missing optional dependency, or an unreadable file | Check the `[DEBUG] Found N … files` and `[ERROR]` lines at startup |
-| A PDF contributes nothing | Scanned image with no text layer | OCR it before ingesting — `PyPDFLoader` does not |
-| Citations show `page unknown` | Format carries no page metadata (txt, docx, xlsx) | Expected; only PDFs provide real page numbers |
-| Documents re-ingest on every start | App launched from the wrong directory | `cd omnivore/src` before `python app.py` |
-| Duplicate chunks in results | Ingestion ran against a populated collection, or `mode=append` was used | Delete `data/vector_store/` and rebuild, or re-ingest that file with `mode=replace` |
-| An edited document still returns its old text | Dedup keys on path, so `skip` left it alone | Re-ingest it with `mode=replace` |
-| `database is locked` during ingest | Two processes writing the same ChromaDB SQLite | Register the blueprint into `app.py` instead of running `ingest_api.py` standalone |
-| `Pipeline error: …` in a response entry | Exception inside `rag.query` — usually the LLM call | Confirm `gemma2:9b` is pulled and RAM is available |
-| Answers ignore the documents | Embedding model changed without re-indexing | Delete `data/vector_store/` and re-ingest |
-| `ModuleNotFoundError: flask` / `langchain_classic` | Missing from `requirements.txt` | See below |
+| `PyPDFLoader` | PDF | One page per document — enables page-level citations |
+| `TextLoader` | `.txt` | UTF-8 by default |
+| `CSVLoader` | `.csv` | One row per document |
+| `Docx2txtLoader` | `.docx` | Requires `docx2txt` |
+| `UnstructuredExcelLoader` | `.xlsx` | Requires `unstructured` + `openpyxl` |
+| `JSONLoader` | `.json` | Needs `jq_schema` to select fields |
+| `WebBaseLoader` | URL | Scrapes and cleans HTML |
+| `DirectoryLoader` | folder | Dispatches per-format |
+| `GitHubIssuesLoader` | GitHub | Auth via token |
+
+**Metadata carries provenance.** The metadata dict — typically `{"source": ..., "page": ...}` — is what makes citations possible downstream. Every loader emits its own metadata shape; keep this in mind when building unified pipelines.
 
 ---
 
-## Known limitations
+## 11. Text Splitters
 
-Findings from a read-through of the current code, worth knowing before you extend it:
+Embedding models and LLMs have context limits, so long documents must be chunked. The splitter decides *where* to cut.
 
-1. **`requirements.txt` is incomplete.** `flask`, `langchain-classic`, and `numpy` are imported but unlisted. Excel and Word loading additionally need `unstructured`/`openpyxl` and `docx2txt` — without them those two formats fail silently into the per-file `except`.
-2. **The SentenceTransformer path is broken.** [`embedding.py:75`](src/rag/embedding.py#L75) calls `self.model.get_embedding_dimension()`; the actual API is `get_sentence_embedding_dimension()`. `use_ollama=False` will raise `AttributeError`. Only the Ollama path is exercised today.
-3. **`data_loader.py` calls `JSONLoader` without `jq_schema`**, which that loader requires — any `.json` file is caught by the `except` and skipped rather than loaded. JSON is therefore nominal on the `app.py` startup path. [`ingest_api.py`](src/ingest_api.py) reads JSON with the standard library instead, which both works and avoids the `jq` dependency (no Windows wheel).
-4. **`stream=True` does not stream the LLM.** [`search.py:30-35`](src/rag/search.py#L30-L35) prints the *prompt* to stdout in 80-char slices with a `sleep`, then makes an ordinary blocking `invoke()`. It is a placeholder, and no API route exposes it. Real streaming needs `llm_model.stream()` plus an SSE endpoint.
-5. **`summarize` is reachable but unused.** `/api/query` accepts and forwards it, and the response carries `summary`, but `app.js` never sends it and never renders it.
-6. **Docstring/default drift.** The comment at [`app.py:129`](src/app.py#L129) claims `min_score=0.2`; the actual default in `AdvancedRAGSearch.query` is `0.1`.
-7. **`VectorStore.__initialize_store` swallows its exception.** On failure it prints and leaves `self.collection = None`, so the real error surfaces later as a confusing `AttributeError` in the retriever. `app.py` partly anticipates this with its `except AttributeError` guard around `count()`.
-8. **`app.py`'s own ingestion path has no deduplication and no incremental update.** Nothing keys on file content or path, so re-running it against a non-empty collection duplicates every chunk, and adding one file means re-embedding the corpus. The `count() > 0` guard is the only thing preventing this. [`ingest_api.py`](src/ingest_api.py) solves both — prefer it over restart-based ingestion.
-9. **`debug=True` is hardcoded** in `app.run()` — fine locally, unsafe anywhere else.
+**`RecursiveCharacterTextSplitter` — the default choice.** It tries a list of separators in descending granularity — paragraphs first, then lines, then words — so cuts land at natural boundaries whenever possible:
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=150,
+    separators=["\n\n", "\n", " ", ""],
+)
+chunks = splitter.split_documents(docs)
+```
+
+**Overlap matters.** A fact split across a chunk boundary must appear intact in *one* of the chunks, or it becomes unretrievable. 10–15% of `chunk_size` is a sensible default.
+
+**Other splitters worth knowing.**
+
+| Splitter | Use case |
+|---|---|
+| `CharacterTextSplitter` | Simple single-separator splitting — usually inferior to the recursive version |
+| `TokenTextSplitter` | Splits on model tokens rather than characters — accurate for context-budget planning |
+| `MarkdownHeaderTextSplitter` | Chunks by heading level, preserving hierarchy in metadata |
+| `RecursiveCharacterTextSplitter.from_language` | Language-aware splitting for source code (Python, JS, etc.) |
+| `SemanticChunker` | Cuts on embedding-similarity discontinuities — smarter but slower |
+
+**Choose chunk size to match your content.** Prose and technical documentation tolerate 1000–1500 chars. Dense reference material and Q&A do better at 500–800, where each chunk stays on-topic. Long-form narrative can go 2000+.
 
 ---
 
-## Extending the project
+## 12. Embeddings
 
-- **More formats** — Markdown, HTML, EPUB, and PowerPoint all have LangChain loaders; each is a dozen lines in `load_all_documents` following the existing pattern.
-- **Corpus switching in the UI** — `VectorStore` already keys on `collection_name`; expose it as a dropdown and Omnivore serves several document sets from one process.
-- **Content-hash dedup** — [`ingest_api.py`](src/ingest_api.py) dedupes on file *path*, so an edited file needs an explicit `mode=replace`. Storing a content digest in metadata would let `skip` detect changes on its own.
-- **Streaming responses** — swap `invoke()` for `stream()` and expose an SSE route; the UI's entry placeholder is already structured to be filled incrementally.
-- **Hybrid retrieval** — add BM25 alongside the dense search and fuse with Reciprocal Rank Fusion; keyword matching materially helps on identifier-heavy technical documents.
-- **Reranking** — insert a cross-encoder between retrieval and generation: fetch `top_k=20`, rerank, keep 5.
-- **Persistent history** — move `AdvancedRAGSearch.history` to SQLite so it survives restarts and multiple workers.
-- **Evaluation harness** — a fixed question set scored on retrieval hit-rate and answer faithfulness, so tuning `chunk_size` / `top_k` / `min_score` stops being guesswork.
-- **Config externalisation** — lift the `app.py` constants into `.env` or a YAML config so corpora and backends can be switched without editing code.
+An embedding model maps a piece of text to a dense vector in some high-dimensional space, such that semantically similar texts land near each other.
+
+```python
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+vec = embeddings.embed_query("What is LangChain?")           # single vector
+vecs = embeddings.embed_documents(["doc one", "doc two"])    # batch
+```
+
+**Common providers.**
+
+| Provider | Class | Notes |
+|---|---|---|
+| OpenAI | `OpenAIEmbeddings` | `text-embedding-3-small` (1536-dim) and `-large` (3072-dim) |
+| Cohere | `CohereEmbeddings` | Strong on retrieval benchmarks |
+| HuggingFace | `HuggingFaceEmbeddings` | Local; wide model choice |
+| Ollama | `OllamaEmbeddings` | Fully local, no API key |
+| Google | `GoogleGenerativeAIEmbeddings` | Gemini family |
+
+**The critical invariant.** The embedding model used to *index* documents must be the same one used to *query* them. Different models produce vectors in incompatible spaces — querying across them yields confident nonsense. If you change embedding models, delete and rebuild the vector store.
+
+---
+
+## 13. Vector Stores
+
+A vector store persists embeddings alongside their source text and metadata, and answers similarity queries efficiently.
+
+```python
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings()
+vector_store = Chroma.from_documents(
+    documents=chunks,
+    embedding=embeddings,
+    persist_directory="./chroma_db",
+)
+
+results = vector_store.similarity_search("What is LCEL?", k=4)
+```
+
+**The landscape.**
+
+| Store | Deployment | Notes |
+|---|---|---|
+| **Chroma** | Local, embedded | SQLite + HNSW. Great for prototypes and small production. |
+| **FAISS** | In-process | Fast, no persistence unless you save/load. |
+| **Pinecone** | Managed cloud | Scales to billions of vectors. Metadata filtering. |
+| **Weaviate** | Self-hosted or managed | Hybrid search built in. |
+| **Qdrant** | Self-hosted or managed | Rust-based, strong metadata filtering. |
+| **PGVector** | Postgres extension | Vectors alongside relational data. |
+| **Milvus** | Self-hosted or managed | Purpose-built for very large scale. |
+| **Redis** | Redis Stack | Vectors alongside your existing cache. |
+
+**Metadata filtering.** Every serious vector store supports filtering by metadata alongside similarity — indispensable for multi-tenant systems or narrowing to a specific document set:
+
+```python
+results = vector_store.similarity_search(
+    "renewal terms",
+    k=4,
+    filter={"source": "master_agreement.pdf"},
+)
+```
+
+**Similarity vs distance.** Different stores return different scales. Chroma returns cosine *distance*, so `similarity = 1 - distance`. Read the store's docs before threshold-tuning.
+
+---
+
+## 14. Retrievers
+
+A `Retriever` is any `Runnable` that takes a query string and returns a list of `Document`s. Every vector store exposes one via `.as_retriever()`, but retrievers are broader than vector stores.
+
+```python
+retriever = vector_store.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 5},
+)
+docs = retriever.invoke("What are the renewal terms?")
+```
+
+**Search types.**
+
+| Type | Behaviour |
+|---|---|
+| `similarity` | Standard top-k nearest neighbours |
+| `similarity_score_threshold` | Filter out results below a score floor |
+| `mmr` | Maximum Marginal Relevance — trades relevance for diversity, avoiding near-duplicate chunks |
+
+**Advanced retrievers.**
+
+- **`MultiQueryRetriever`** — asks an LLM to rewrite the query in multiple forms, retrieves for each, and merges results. Helps with imprecise queries.
+- **`ContextualCompressionRetriever`** — pipes retrieved chunks through a compressor (often an LLM) that extracts only the query-relevant sentences.
+- **`ParentDocumentRetriever`** — indexes small chunks for precise retrieval but returns their larger parent documents for context.
+- **`SelfQueryRetriever`** — parses natural-language queries into `(semantic query, metadata filter)` pairs using an LLM.
+- **`EnsembleRetriever`** — combines multiple retrievers (e.g. BM25 keyword + dense semantic) with Reciprocal Rank Fusion.
+- **`BM25Retriever`** — classical keyword retrieval; strong on identifier-heavy technical content where exact tokens matter.
+
+Hybrid search — dense semantic **plus** BM25 keyword, fused — is the single most impactful upgrade over pure vector search for real-world corpora.
+
+---
+
+## 15. Retrieval-Augmented Generation (RAG)
+
+RAG is the pattern of grounding an LLM's answer in retrieved documents rather than parametric memory. The canonical LCEL shape:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+prompt = ChatPromptTemplate.from_template("""
+Answer the question based ONLY on the following context. If the context does not
+contain the answer, say "I don't know."
+
+Context:
+{context}
+
+Question: {question}
+""")
+
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
+
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+
+rag_chain.invoke("What are the renewal terms?")
+```
+
+**Anatomy.** Every RAG system has the same six stages:
+
+1. **Load** documents from sources.
+2. **Split** them into chunks.
+3. **Embed** the chunks.
+4. **Store** them in a vector store.
+5. **Retrieve** the top-k relevant chunks per query.
+6. **Generate** an answer conditioned on those chunks, with citations.
+
+Stages 1–4 are indexing (offline, one-time). Stages 5–6 are the query path (per-request).
+
+**Design decisions that actually matter.**
+
+- **Chunk size and overlap** — controls recall vs coherence.
+- **Retriever strategy** — dense-only vs hybrid; single-query vs multi-query.
+- **Top-k and threshold** — recall vs noise. Too much context degrades answer quality even when the model *can* handle it.
+- **Prompt discipline** — instruct the model to abstain when context is insufficient. Grounded models must refuse to guess.
+- **Reranking** — a cross-encoder reranker between retrieval and generation (fetch top-20, keep top-5) dramatically improves quality on hard queries.
+- **Citations** — surface source metadata alongside answers. Answers you cannot audit are answers you cannot trust.
+
+**Advanced RAG patterns worth studying:**
+
+- **HyDE** (Hypothetical Document Embeddings) — embed a hallucinated answer rather than the raw query.
+- **Query decomposition** — break a multi-part question into sub-queries, retrieve for each, then synthesise.
+- **Corrective RAG (CRAG)** — grade retrieved documents and fall back to web search on low confidence.
+- **Self-RAG** — the model decides *whether* to retrieve, and self-critiques its own output.
+- **GraphRAG** — build a knowledge graph over the corpus and traverse it during retrieval.
+
+---
+
+## 16. Tools and Function Calling
+
+A **tool** is a Python function the LLM can choose to call. The framework handles the schema conversion, invocation, and result routing.
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply two integers and return the product."""
+    return a * b
+
+@tool
+def get_weather(city: str) -> str:
+    """Get the current weather for a city."""
+    return f"The weather in {city} is 22 degC and sunny."
+```
+
+The `@tool` decorator introspects the function signature and docstring to build the JSON schema the model needs. Docstrings are not decoration — they are what the model reads to decide when to use the tool.
+
+**Bind tools to a model:**
+
+```python
+llm_with_tools = llm.bind_tools([multiply, get_weather])
+response = llm_with_tools.invoke("What's 27 times 43?")
+print(response.tool_calls)
+# [{'name': 'multiply', 'args': {'a': 27, 'b': 43}, 'id': '...'}]
+```
+
+**Execute the calls and feed results back:**
+
+```python
+from langchain_core.messages import HumanMessage, ToolMessage
+
+messages = [HumanMessage("What is 27 * 43?")]
+ai_msg = llm_with_tools.invoke(messages)
+messages.append(ai_msg)
+
+for call in ai_msg.tool_calls:
+    tool_fn = {"multiply": multiply, "get_weather": get_weather}[call["name"]]
+    result = tool_fn.invoke(call["args"])
+    messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+
+final = llm_with_tools.invoke(messages)
+```
+
+This loop — call model → execute tools → feed results → call model again — is exactly what an agent does.
+
+---
+
+## 17. Agents
+
+An agent is a loop: the LLM chooses actions (tool calls), tools execute, results feed back, the LLM decides what to do next. It stops when the model returns a plain answer instead of a tool call.
+
+**Modern approach: LangGraph's prebuilt ReAct agent.**
+
+```python
+from langgraph.prebuilt import create_react_agent
+
+agent = create_react_agent(llm, tools=[multiply, get_weather])
+result = agent.invoke({
+    "messages": [("user", "What's the weather in Paris, and what's 15 * 27?")]
+})
+```
+
+Under the hood this is a graph: a "call model" node and a "call tools" node, with a conditional edge back to the model until it stops requesting tools.
+
+**Legacy agents** (`initialize_agent`, `AgentExecutor`, `ZeroShotAgent`, etc.) are deprecated. Modern LangChain routes all agent construction through LangGraph.
+
+**When agents work well.** When the model needs to reason across several steps that depend on intermediate results (fetch data → compute → decide next fetch). When the tool call structure is dynamic — you don't know in advance which tools will be needed or in what order.
+
+**When they don't.** For deterministic pipelines, a fixed LCEL chain is faster, cheaper, and more predictable. Agents introduce nondeterminism and latency; use them only when their flexibility earns its keep.
+
+---
+
+## 18. LangGraph: stateful, cyclical workflows
+
+LangGraph is the successor to `AgentExecutor`. It models an application as a **state graph**: nodes are functions that read and update shared state, edges route between nodes (conditionally or unconditionally), and cycles are first-class.
+
+**The mental model.** LCEL composes runnables into a DAG — directed and acyclic. LangGraph adds cycles, branching, and durable state. Anything that involves "keep going until X" (agents, planners, self-critique loops) belongs in LangGraph.
+
+```python
+from typing import TypedDict, Annotated
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langchain_core.messages import HumanMessage
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+def call_model(state: State):
+    response = llm.invoke(state["messages"])
+    return {"messages": [response]}
+
+graph = StateGraph(State)
+graph.add_node("model", call_model)
+graph.add_edge(START, "model")
+graph.add_edge("model", END)
+
+app = graph.compile()
+app.invoke({"messages": [HumanMessage("Hello!")]})
+```
+
+**Why it matters.**
+
+- **Persistence.** Compile with a `checkpointer` and every state transition is durable. Resume conversations across processes.
+- **Human-in-the-loop.** Interrupt before a node executes, wait for human approval, then resume.
+- **Time travel.** Rewind to any previous state and re-run from there.
+- **Streaming.** Stream at the token, message, or state-transition level.
+- **Subgraphs.** Compose graphs as nodes within other graphs.
+
+**Common patterns.**
+
+- **ReAct agents** — model node + tools node + conditional edge (via `create_react_agent`).
+- **Plan-and-execute** — planner node emits a step list, executor node runs them one at a time.
+- **Reflection loops** — generator node produces output, critic node evaluates it, cycle until the critic passes.
+- **Multi-agent** — several specialist agents as nodes, a supervisor node that routes between them.
+
+LangGraph is where advanced LangChain lives today. If you are building anything more sophisticated than a linear pipeline, learn it.
+
+---
+
+## 19. Streaming, Callbacks, and Tracing
+
+**Streaming.** Every LCEL chain supports `.stream()` and `.astream()` — no extra plumbing:
+
+```python
+for chunk in chain.stream({"topic": "cats"}):
+    print(chunk, end="", flush=True)
+```
+
+For finer-grained events (which node ran, what it emitted), use `.astream_events(version="v2")`. This yields structured events for every runnable in the chain and is what production streaming UIs are built on.
+
+**Callbacks.** The `BaseCallbackHandler` interface lets you hook into lifecycle events — `on_llm_start`, `on_llm_new_token`, `on_tool_end`, and so on. Use it for custom logging, metrics, or UI updates:
+
+```python
+from langchain_core.callbacks import BaseCallbackHandler
+
+class TokenCounter(BaseCallbackHandler):
+    def __init__(self):
+        self.tokens = 0
+    def on_llm_new_token(self, token, **kwargs):
+        self.tokens += 1
+
+counter = TokenCounter()
+chain.invoke({"topic": "cats"}, config={"callbacks": [counter]})
+```
+
+**Tracing with LangSmith.** Set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` in your environment. Every LCEL run is automatically traced — each step's input, output, latency, and token count is captured in a UI you can drill into. This is the single fastest way to debug a chain you don't understand.
+
+---
+
+## 20. Structured Output
+
+The reliable way to get typed output from a modern model is **`with_structured_output`**, which uses the provider's native tool-calling machinery under the hood.
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal
+
+class Classification(BaseModel):
+    """Classification of a customer support ticket."""
+    category: Literal["billing", "technical", "account", "other"]
+    urgency: Literal["low", "medium", "high"]
+    summary: str = Field(description="One-sentence summary")
+
+structured_llm = llm.with_structured_output(Classification)
+
+result = structured_llm.invoke("My credit card was charged twice for last month.")
+print(result.category, result.urgency)
+```
+
+The return value is a validated Pydantic instance. No parsing, no format-instruction gymnastics.
+
+**When to use each approach:**
+
+| Approach | Use when |
+|---|---|
+| `.with_structured_output(schema)` | Provider supports tool calling (OpenAI, Anthropic, Google, most others). This is the default. |
+| `JsonOutputParser` | Provider has no native structured output, or you need a fallback. |
+| `PydanticOutputParser` | Same, plus you want validation. |
+
+---
+
+## 21. Multi-modal chains
+
+Modern chat models (GPT-4o, Claude, Gemini) accept images alongside text. LangChain surfaces this as content-block messages:
+
+```python
+from langchain_core.messages import HumanMessage
+import base64
+
+with open("chart.png", "rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
+
+message = HumanMessage(content=[
+    {"type": "text", "text": "What does this chart show?"},
+    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+])
+response = llm.invoke([message])
+```
+
+The same shape works for URL-referenced images, and for Anthropic's document-input format. Audio and video are supported by provider-specific integrations where the model itself supports them.
+
+---
+
+## 22. Evaluation with LangSmith
+
+You cannot improve what you cannot measure. LangSmith provides datasets, evaluators, and experiment tracking for LLM apps.
+
+**The workflow.**
+
+1. Curate a **dataset** — inputs (and optionally reference outputs) representative of production.
+2. Define **evaluators** — functions that grade an output on some criterion.
+3. Run your chain against the dataset and record scores.
+4. Iterate on the chain and compare experiments.
+
+```python
+from langsmith import Client
+from langsmith.evaluation import evaluate
+
+client = Client()
+
+def exact_match(run, example):
+    return {"key": "exact_match", "score": run.outputs["answer"] == example.outputs["answer"]}
+
+results = evaluate(
+    lambda inputs: {"answer": chain.invoke(inputs["question"])},
+    data="my-dataset-name",
+    evaluators=[exact_match],
+    experiment_prefix="rag-v2",
+)
+```
+
+**Evaluator types.**
+
+- **Heuristic** — exact match, regex, embedding similarity to reference.
+- **LLM-as-judge** — a model grades outputs against criteria (helpfulness, faithfulness, safety). Widely used, but calibrate against human labels before trusting it.
+- **Human** — annotators grade outputs in the LangSmith UI. The gold standard.
+- **Pairwise** — for A/B comparison of two chain versions on the same input.
+
+**RAG-specific metrics** to track: retrieval hit-rate (was the right chunk retrieved?), answer faithfulness (did the answer stick to the retrieved context?), answer relevance (did it address the question?).
+
+---
+
+## 23. Production concerns
+
+Real deployments care about the boring parts. LangChain has answers for most of them.
+
+**Rate limiting.** Every chat model accepts a `rate_limiter` argument built from `InMemoryRateLimiter` — the framework blocks calls to stay under provider quotas.
+
+**Retries.** Wrap any runnable in `.with_retry()`:
+
+```python
+robust_chain = chain.with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
+```
+
+**Fallbacks.** If the primary model or route fails, fall through to an alternative:
+
+```python
+chain_with_fallback = primary_chain.with_fallbacks([backup_chain])
+```
+
+Common uses: fall back from a large model to a smaller one, or from one provider to another during outages.
+
+**Caching.** Enable an in-memory or Redis-backed cache to deduplicate identical requests:
+
+```python
+from langchain_core.caches import InMemoryCache
+from langchain_core.globals import set_llm_cache
+set_llm_cache(InMemoryCache())
+```
+
+**Deployment with LangServe.** Expose any runnable as a REST API:
+
+```python
+from fastapi import FastAPI
+from langserve import add_routes
+
+app = FastAPI()
+add_routes(app, chain, path="/chat")
+```
+
+You get REST, streaming, batch, and OpenAPI docs for free.
+
+**Cost tracking.** Every provider's chat-model response includes `usage_metadata` with input, output, and total tokens. Multiply by provider pricing to attribute cost per request.
+
+**Security.**
+
+- Never trust LLM-generated code, SQL, or shell commands without a sandbox.
+- Sanitise retrieved content before rendering — RAG can surface prompt-injection payloads sitting in documents.
+- Rate-limit and authenticate any tool that touches shared systems.
+
+---
+
+## 24. Common pitfalls
+
+Recurring mistakes worth knowing about before you hit them:
+
+1. **Mixing embedding models across index and query.** Vectors from different models are not comparable. Rebuild the index whenever the embedding model changes.
+2. **Chunk size too large.** A 4000-char chunk contains multiple topics — retrieval finds it for anything, and none of it precisely.
+3. **`top_k` too high.** More context is not always better; noise degrades answers.
+4. **No abstention prompt.** Without an instruction to say "I don't know," models fill gaps with parametric memory and lie confidently.
+5. **Blindly trusting LLM-as-judge scores.** Calibrate against a human-labelled slice before treating them as ground truth.
+6. **Legacy chains in new code.** `LLMChain`, `RetrievalQA`, `ConversationChain`, `initialize_agent` — all superseded. Use LCEL and LangGraph.
+7. **Unbounded conversation history.** Memory grows until you hit the context limit and everything breaks at once. Trim from the start.
+8. **Hardcoded API keys.** Use `.env` and add it to `.gitignore`.
+9. **No observability.** Chains are opaque; enable LangSmith tracing in dev at minimum.
+10. **Streaming lost.** If any step in an LCEL chain buffers (e.g. a parser that needs the full output), streaming stops working end-to-end. Use `JsonOutputParser` variants that support partial parsing.
+
+---
+
+## 25. Further reading
+
+**Official documentation**
+- LangChain: https://python.langchain.com
+- LangGraph: https://langchain-ai.github.io/langgraph
+- LangSmith: https://docs.smith.langchain.com
+
+**Foundational papers**
+- **RAG** — Lewis et al., *Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks* (2020)
+- **ReAct** — Yao et al., *ReAct: Synergizing Reasoning and Acting in Language Models* (2022)
+- **HyDE** — Gao et al., *Precise Zero-Shot Dense Retrieval without Relevance Labels* (2022)
+- **Self-RAG** — Asai et al., *Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection* (2023)
+- **Corrective RAG** — Yan et al., *Corrective Retrieval Augmented Generation* (2024)
+
+**Recommended path if you are starting today**
+
+1. Build a linear LCEL chain (`prompt | llm | parser`) and read every step's output.
+2. Add a retriever and turn it into a minimal RAG chain.
+3. Wrap it in `RunnableWithMessageHistory` for multi-turn.
+4. Add one tool and let the model call it via `bind_tools`.
+5. Convert to `create_react_agent` and observe the difference.
+6. Introduce LangSmith tracing and, once you have a dataset, evaluation.
+7. Model your first cyclical workflow explicitly in LangGraph.
+
+By the time you are comfortable with all seven, you are past "tutorial" and into the working knowledge that production systems rely on.
